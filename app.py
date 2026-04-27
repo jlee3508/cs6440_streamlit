@@ -14,6 +14,7 @@ st.set_page_config(
 )
 
 DATA_PATH = "data/processed/county_facts.csv"
+MODEL_PATH = "data/processed/model_predictions_full.csv"
 
 RISK_METRICS = {
     "diabetes_pct": "Current diabetes prevalence",
@@ -41,6 +42,7 @@ RISK_WEIGHTS = {
     "diabetes_pct_yoy_change_pos": 0.00,  # replaced after derived column added
 }
 
+# keep weights summing to 1 after adding yoy trend
 RISK_WEIGHTS["diabetes_pct_yoy_change_pos"] = 1.0 - sum(
     value for key, value in RISK_WEIGHTS.items() if key != "diabetes_pct_yoy_change_pos"
 )
@@ -125,21 +127,38 @@ def _prepare_dashboard_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["county_display", "report_year"]).reset_index(drop=True)
     return df
 
+def _prepare_model_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = _normalize_numeric_columns(df)
+    required_cols = {"fips_code", "locationname", "stateabbr", "report_year", "diabetes_pct", "is_forecast", "top_factors"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        missing_text = ", ".join(sorted(missing))
+        raise ValueError(f"Processed data is missing required columns: {missing_text}")
+
+    df["county_display"] = df["locationname"].astype(str) + ", " + df["stateabbr"].astype(str)
+
+
+
+    df = df.sort_values(["stateabbr", "report_year"]).reset_index(drop=True)
+    return df
+
 
 @st.cache_data(show_spinner=False)
 def _read_local_data(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def _build_or_refresh_data(force_refresh: bool = False) -> Tuple[pd.DataFrame, str]:
+def _build_or_refresh_data(force_refresh: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
     if not force_refresh and os.path.exists(DATA_PATH):
         df = _read_local_data(DATA_PATH)
-        return _prepare_dashboard_data(df), f"Loaded cached processed data from {DATA_PATH}"
+        model_df = _read_local_data(MODEL_PATH)
+        return _prepare_dashboard_data(df), _prepare_model_data(model_df), "Loaded cached processed data"
 
     df = runPipeline()
     saveOutput(df)
+    model_df = _read_local_data(MODEL_PATH)
     _read_local_data.clear()
-    return _prepare_dashboard_data(df), "Fetched fresh CDC PLACES data and rebuilt processed features"
+    return _prepare_dashboard_data(df), _prepare_model_data(model_df), "Fetched fresh CDC PLACES data and rebuilt processed features"
 
 
 def _top_contributing_factors(row: pd.Series, n: int = 3) -> List[str]:
@@ -161,11 +180,6 @@ def _render_empty_chart(message: str) -> None:
 
 
 st.title("Diabetes Progression Risk Dashboard")
-st.caption(
-    "This keeps the original dashboard layout, but now reads real county-level CDC PLACES data. "
-    "The current risk score is a feature-based ranking proxy built from prevalence and trend inputs "
-    "until a trained prediction model is added."
-)
 
 top_col_left, top_col_right = st.columns([1, 4])
 
@@ -173,11 +187,11 @@ with top_col_left:
     refresh_clicked = st.button("Refresh Data", use_container_width=True)
 
 try:
-    dashboard_df, data_status = _build_or_refresh_data(force_refresh=refresh_clicked)
+    dashboard_df, model_df, data_status = _build_or_refresh_data(force_refresh=refresh_clicked)
 except Exception as exc:
     st.error(
         "The dashboard could not load backend data. "
-        "Either place a processed file at data/processed/county_facts.csv "
+        "Either place the processed files at data/processed/county_facts.csv and data/processed/model_predictions_full.csv"
         "or allow the app to reach the CDC API."
     )
     st.exception(exc)
@@ -220,10 +234,6 @@ with tab1:
             index=0
         )
 
-        county_search = st.text_input(
-            "Search County",
-            placeholder="Enter county name"
-        )
 
     with col2:
         st.subheader("Top Counties by Predicted Diabetes Risk")
@@ -235,11 +245,6 @@ with tab1:
 
         if risk_level != "All":
             filtered_df = filtered_df[filtered_df["risk_level"] == risk_level]
-
-        if county_search.strip():
-            filtered_df = filtered_df[
-                filtered_df["locationname"].str.contains(county_search, case=False, na=False)
-            ]
 
         filtered_df = filtered_df.sort_values("risk_score", ascending=False)
 
@@ -276,6 +281,8 @@ with tab2:
 
     col1, col2 = st.columns([1, 3])
 
+    county_options = model_df["county_display"].dropna().astype(str).unique().tolist()
+
     with col1:
         county_detail = st.selectbox(
             "Select County",
@@ -284,20 +291,25 @@ with tab2:
         )
 
     with col2:
-        county_rows = dashboard_df[dashboard_df["county_display"] == county_detail].copy()
+        county_rows = model_df[model_df["county_display"] == county_detail].copy()
         county_rows = county_rows.sort_values("report_year")
 
         if county_rows.empty:
             st.warning("No county detail is available for the selected county.")
         else:
             latest_row = county_rows.iloc[-1]
-            factors = _top_contributing_factors(latest_row)
+            factors = latest_row["top_factors"].split(",")
+
+            if latest_row['risk_probability'] > 0.66:
+                risk = "HIGH"
+            elif latest_row['risk_probability'] > 0.33:
+                risk = "MEDIUM"
+            else:
+                risk = "LOW"
 
             st.subheader(f"County Detail: {county_detail}")
-            st.markdown(f"**Predicted Progression Risk: {str(latest_row['risk_level']).upper()}**")
-            st.markdown(
-                f"**Current Diabetes Prevalence:** {latest_row['diabetes_prevalence_label']}"
-            )
+            st.markdown(f"**Predicted Progression Risk: {risk}**")
+            st.markdown( f"**Forecasted 2030 Diabetes Prevalence:** {latest_row['diabetes_pct']}")
 
             inner_col1, inner_col2 = st.columns(2)
 
@@ -310,14 +322,37 @@ with tab2:
                 st.markdown("#### Trend Over Time")
 
                 fig2, ax2 = plt.subplots(figsize=(6, 4))
-                ax2.plot(
-                    county_rows["report_year"],
-                    county_rows["diabetes_pct"],
-                    marker="o"
-                )
+
+                truth = county_rows[county_rows["is_forecast"] == False].copy()
+                forecast = county_rows[county_rows["is_forecast"] == True].copy()
+
+                x_years = county_rows["report_year"].astype(int).tolist()
+
+                if not truth.empty:
+                    ax2.plot(
+                        truth["report_year"],
+                        truth["diabetes_pct"],
+                        marker="o",
+                        linestyle="-",
+                        color="blue",
+                        label="Historical"
+                    )
+
+                if not forecast.empty:
+                    ax2.plot(
+                        forecast["report_year"],
+                        forecast["diabetes_pct"],
+                        marker="o",
+                        linestyle="--",
+                        color="orange",
+                        label="Forecast"
+                    )
+
+                ax2.set_xticks(x_years)
                 ax2.set_title("Diabetes Prevalence by Year")
                 ax2.set_xlabel("Year")
                 ax2.set_ylabel("Diabetes Prevalence (%)")
+                ax2.legend()
                 plt.tight_layout()
 
                 st.pyplot(fig2)
