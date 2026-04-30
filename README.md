@@ -1,3 +1,4 @@
+
 # Diabetes Progression Risk Dashboard
 
 CS6440 Group 34
@@ -130,5 +131,3 @@ On first launch without pre-generated data, the app will call the CDC API and bu
 `requirements.txt` in this repository reflects the Streamlit Community Cloud deployment. Install locally with `pip install -r requirements.txt`.
 
 ---
-
-
